@@ -22,14 +22,61 @@ except ImportError as exc:  # Friendly message when launched outside a terminal.
 
 
 APP_NAME = "MicBridge"
-MAGIC = b"MB01"
-HEADER = struct.Struct("!4sIB")
+APP_VERSION = "2.1"
+MAGIC_V1 = b"MB01"
+MAGIC_V2 = b"MB02"
+LEGACY_HEADER = struct.Struct("!4sI")
+HEADER = struct.Struct("!4sIBH")  # magic, sequence, channels, frames
 ACK_MAGIC = b"MBAK"
 ACK_HEADER = struct.Struct("!4sI")
 SAMPLE_RATE = 48_000
-BLOCK_FRAMES = 960  # 20 ms at 48 kHz
+BLOCK_FRAMES = 240  # 5 ms; stereo packets remain below a typical 1500-byte MTU
 SAMPLE_WIDTH = 2
 DEFAULT_PORT = 50_000
+
+
+def encode_packet(sequence: int, channels: int, audio: bytes) -> bytes:
+    frames = len(audio) // (channels * SAMPLE_WIDTH)
+    return HEADER.pack(MAGIC_V2, sequence, channels, frames) + audio
+
+
+def decode_packet(packet: bytes) -> tuple[int, int, int, bytes, str] | None:
+    """Decode v2 plus both previously shipped MB01 packet layouts."""
+    if len(packet) >= HEADER.size and packet[:4] == MAGIC_V2:
+        _magic, sequence, channels, frames = HEADER.unpack_from(packet)
+        expected = HEADER.size + frames * channels * SAMPLE_WIDTH
+        if channels in (1, 2) and frames > 0 and len(packet) == expected:
+            return sequence, channels, frames, packet[HEADER.size:], "v2"
+        return None
+
+    if len(packet) >= LEGACY_HEADER.size and packet[:4] == MAGIC_V1:
+        _magic, sequence = LEGACY_HEADER.unpack_from(packet)
+        if len(packet) >= LEGACY_HEADER.size + 1:
+            channels = packet[LEGACY_HEADER.size]
+            audio = packet[LEGACY_HEADER.size + 1:]
+            if channels in (1, 2) and len(audio) == 960 * channels * SAMPLE_WIDTH:
+                return sequence, channels, 960, audio, "v1.1"
+        audio = packet[LEGACY_HEADER.size:]
+        if len(audio) == 960 * SAMPLE_WIDTH:
+            return sequence, 1, 960, audio, "v1.0"
+    return None
+
+
+def convert_channels(audio: bytes, source: int, target: int) -> bytes:
+    if source == target:
+        return audio
+    samples = array.array("h")
+    samples.frombytes(audio)
+    converted = array.array("h")
+    if source == 1 and target == 2:
+        for sample in samples:
+            converted.extend((sample, sample))
+    elif source == 2 and target == 1:
+        for index in range(0, len(samples), 2):
+            converted.append((samples[index] + samples[index + 1]) // 2)
+    else:
+        raise ValueError("対応していないチャンネル変換です")
+    return converted.tobytes()
 
 
 def audio_devices(kind: str, channels: int) -> list[tuple[int, str]]:
@@ -130,7 +177,7 @@ class Sender:
                 except queue.Empty:
                     audio = None
                 if audio is not None:
-                    sock.sendto(HEADER.pack(MAGIC, sequence, self.channels) + audio, (target_ip, self.port))
+                    sock.sendto(encode_packet(sequence, self.channels, audio), (target_ip, self.port))
                     sequence = (sequence + 1) & 0xFFFFFFFF
 
                 while True:
@@ -185,6 +232,8 @@ class Receiver:
         self.expected_sequence: int | None = None
         self.play_ready = threading.Event()
         self.last_packet_at = 0.0
+        self.pending_audio = bytearray()
+        self.packet_count = 0
 
     def start(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -230,15 +279,22 @@ class Receiver:
                 self.play_queue.put_nowait(audio)
             except queue.Empty:
                 pass
-        if self.play_queue.qsize() >= 3:
+        if self.play_queue.qsize() >= 6:
             self.play_ready.set()
 
+    def _append_audio(self, audio: bytes, source_channels: int):
+        self.pending_audio.extend(convert_channels(audio, source_channels, self.channels))
+        chunk_size = BLOCK_FRAMES * self.channels * SAMPLE_WIDTH
+        while len(self.pending_audio) >= chunk_size:
+            self._enqueue(bytes(self.pending_audio[:chunk_size]))
+            del self.pending_audio[:chunk_size]
+
     def _receive_loop(self):
-        packet_size = HEADER.size + len(self.silence)
         peer = None
+        protocol = ""
         while not self.stop_event.is_set():
             try:
-                packet, address = self.sock.recvfrom(packet_size + 64)  # type: ignore[union-attr]
+                packet, address = self.sock.recvfrom(65_535)  # type: ignore[union-attr]
             except socket.timeout:
                 if self.last_packet_at and time.monotonic() - self.last_packet_at > 2.0:
                     peer = None
@@ -247,11 +303,11 @@ class Receiver:
                 continue
             except OSError:
                 break
-            if len(packet) != packet_size:
+            decoded = decode_packet(packet)
+            if decoded is None:
+                self.status(f"UDPは到着しましたが形式が不正です ← {address[0]} ({len(packet)} bytes)")
                 continue
-            magic, sequence, channels = HEADER.unpack_from(packet)
-            if magic != MAGIC or channels != self.channels:
-                continue
+            sequence, source_channels, frames, audio, received_protocol = decoded
             self.last_packet_at = time.monotonic()
             try:
                 self.sock.sendto(ACK_HEADER.pack(ACK_MAGIC, sequence), address)  # type: ignore[union-attr]
@@ -260,20 +316,27 @@ class Receiver:
             if peer != address:
                 peer = address
                 self.expected_sequence = sequence
-                self.status(f"受信中 ← {address[0]}:{address[1]}")
+                self.pending_audio.clear()
                 self.connection(f"接続済み  {address[0]}")
 
             if self.expected_sequence is not None:
                 gap = (sequence - self.expected_sequence) & 0xFFFFFFFF
                 if 0 < gap < 4:
                     for _ in range(gap):
-                        self._enqueue(self.silence)
+                        missing = bytes(frames * source_channels * SAMPLE_WIDTH)
+                        self._append_audio(missing, source_channels)
                 elif gap >= 0x80000000:  # old or reordered packet
                     continue
-            audio = packet[HEADER.size:]
             self.level(audio_level_percent(audio))
-            self._enqueue(audio)
+            self._append_audio(audio, source_channels)
             self.expected_sequence = (sequence + 1) & 0xFFFFFFFF
+            self.packet_count += 1
+            if protocol != received_protocol or self.packet_count % 200 == 1:
+                protocol = received_protocol
+                self.status(
+                    f"受信中 ← {address[0]}:{address[1]} / {protocol} / "
+                    f"{source_channels}ch / {self.packet_count} packets"
+                )
 
     def stop(self):
         self.stop_event.set()
@@ -312,7 +375,7 @@ def local_ipv4_addresses() -> list[str]:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("590x540")
         self.minsize(540, 510)
         self.worker: Sender | Receiver | None = None
@@ -321,7 +384,7 @@ class App(tk.Tk):
         self.role = tk.StringVar(value="send")
         # Most built-in microphones expose a single input channel. Starting in
         # stereo used to filter all of them out and made the list look broken.
-        self.channel_mode = tk.StringVar(value="モノラル")
+        self.channel_mode = tk.StringVar(value="ステレオ")
         self.device = tk.StringVar()
         self.host = tk.StringVar()
         self.port = tk.StringVar(value=str(DEFAULT_PORT))
@@ -339,7 +402,7 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=20)
         root.pack(fill="both", expand=True)
 
-        ttk.Label(root, text="PC間で音声を送受信", font=("TkDefaultFont", 17, "bold")).pack(anchor="w")
+        ttk.Label(root, text=f"PC間で音声を送受信  v{APP_VERSION}", font=("TkDefaultFont", 17, "bold")).pack(anchor="w")
         ttk.Label(root, text="2台を同じLANに接続してください。", foreground="#555").pack(anchor="w", pady=(2, 18))
 
         roles = ttk.Frame(root)
@@ -409,7 +472,14 @@ class App(tk.Tk):
         names = [name for _, name in self.devices]
         self.device_combo["values"] = names
         if names:
-            preferred = next((n for n in names if kind == "output" and "BlackHole" in n), names[0])
+            preferred = next(
+                (
+                    n for n in names
+                    if "BlackHole" in n
+                    or (kind == "output" and "CABLE Input" in n)
+                ),
+                names[0],
+            )
             self.device.set(preferred)
         else:
             self.device.set("")

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0
+
+- 接続状態と音量メーターを追加
+- 5 msのMTU安全なv2パケットと旧版受信互換性を維持
+- BlackHoleとWindowsのCABLE Inputを優先選択
+
 ## 2.0.0
 
 - MacとWindowsの双方向送受信に対応
