@@ -1,0 +1,28 @@
+Mac側のMicBridge送信プログラムだけを、次の仕様へ修正してください。受信側はすでに更新済みなので、受信側ファイルは変更しないでください。
+
+目的:
+MacのBlackHole 2chから取得した音楽を、同一LAN上のWindowsへUDP送信する。UDP断片化による受信失敗を防ぐ。
+
+必須仕様:
+1. 音声は48,000 Hz、signed 16-bit little-endian PCM、ステレオ2ch。
+2. 1パケットは240 frames（5 ms）にする。ステレオ音声ペイロードは960 bytes。
+3. UDPヘッダーはPython structのネットワークバイトオーダー `!4sIBH` とする。
+4. ヘッダー値は順に magic=`b"MB02"`、sequence=uint32、channels=2、frames=240。
+5. UDPデータグラムは `header + PCM audio`。合計971 bytes。
+6. sequenceは0から開始し、パケットごとに1増加させ、`& 0xFFFFFFFF`で循環させる。
+7. 宛先はユーザーが入力したWindowsのIPv4アドレス、既定ポートは50000。
+8. 音声入力コールバック内ではネットワーク送信せず、bounded queueへbytesを入れ、別スレッドでUDP送信する。
+9. キューが満杯なら最古の音声を捨て、遅延が増え続けないようにする。
+10. GUIの「開始」「停止」、BlackHole 2chの選択、宛先IP、ポート指定は維持する。
+
+Pythonでのヘッダー生成例:
+
+    HEADER = struct.Struct("!4sIBH")
+    packet = HEADER.pack(b"MB02", sequence, 2, 240) + audio_bytes
+    sock.sendto(packet, (windows_ip, port))
+
+確認項目:
+- 1パケットの総サイズが971 bytesであること。
+- 連続するsequence番号を受信側へ送っていること。
+- BlackHole 2chから実際に音声レベルを取得できていること。
+- 既存の受信側コードや受信側ファイルは変更しないこと。
